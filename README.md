@@ -1,66 +1,142 @@
-# DistServe
+# RecompOrMigrate (KVRS)
 
-DistServe improves the performance of large language models (LLMs) serving by disaggregating the prefill and decoding
-computation. Existing LLM serving systems colocate the two
-phases and batch the computation of prefill and decoding
-across all users and requests. We find that this strategy not
-only leads to strong prefill-decoding interferences but also
-couples the resource allocation and parallelism plans for both
-phases. In DistServe, you can simply set the parallelism configs and scheduling strategies for the two phases and it will work just like a single instance which handles the KV-Cache communication and memory management automatically. 
+**Network‑Aware KV Cache Recovery Scheduler for Disaggregated LLM Inference**
 
-It utilizes a high-performance C++ Transformer inference library [SwiftTransformer](https://github.com/LLMServe/SwiftTransformer) as the execution backend, which supports many features like model/pipeline parallelism, FlashAttention, Continuous Batching, and PagedAttention.
+[![Built on DistServe](https://img.shields.io/badge/built%20on-DistServe-blueviolet)](https://github.com/LLMServe/DistServe)
 
-It supports:
-- GPT-2 (gpt2, gpt2-xl, ...)
-- OPT (facebook/opt-1.3b, facebook/opt-6.7b, ...)
-- LLaMA2 (meta-llama/Llama-2-7b, meta-llama/Llama-2-13b, ...)
+---
 
-## Build && Install
-```shell
-# clone the project
-git clone https://github.com/LLMServe/DistServe.git && cd DistServe
+## Abstract
 
-# setup the distserve conda environment
-conda env create -f environment.yml && conda activate distserve
+When a decode GPU fails in a disaggregated LLM serving system, the request must be reassigned to a different node. The system faces a choice: **migrate** the existing KV cache over the network, or **recompute** the KV cache from scratch on the new node. The optimal decision depends on dynamic network bandwidth and prompt length, yet existing systems use a static “always‑migrate” policy.
 
-# clone and build the SwiftTransformer library  
-git clone https://github.com/LLMServe/SwiftTransformer.git && cd SwiftTransformer && git submodule update --init --recursive
-cmake -B build && cmake --build build -j$(nproc)
-cd ..
+**RecompOrMigrate (KVRS)** extends DistServe with a lightweight, **network‑aware** scheduler that per‑request estimates both costs and picks the faster path. The decision is made in `O(1)` and adds zero overhead on the healthy path. On a two‑node A100 cluster, KVRS recovers up to **8.6%** of lost goodput compared to the static baseline.
 
-# install distserve
-pip install -e .
+---
+
+## Problem & Approach
+
+Disaggregated prefill‑decode architectures co‑locate paired workers on the same node so that KV cache transfer uses intra‑node NVLink (~600 GB/s). After a decode‑worker failure, however, the KV cache must cross a commodity Ethernet fabric (10–100 Gbps), inflating transfer time by 6–60×.
+
+Two execution paths exist after a failure:
+
+![Execution paths: Normal, Migrate, Recompute](img/execution_paths.png)  
+
+- **Migrate** – transfer the full KV cache from the still‑alive prefill GPU to a healthy decode GPU over Ethernet.  
+  *Cost:* `C_mig = S_KV(L) / (bandwidth × 10⁶)`.
+- **Recompute** – drop the KV cache and rerun prefill on a new node.  
+  *Cost:* `C_recomp = T_prefill(L)`.
+
+The crossover point where both costs are equal depends on prompt length `L` and available bandwidth `B`. It varies by **three orders of magnitude** across realistic settings, meaning no static policy can be optimal everywhere.
+
+![Crossover surface](img/crossover_surface.png)  
+*Crossover queue depth across bandwidth and sequence length. Values range from near 0 to >250.*
+
+---
+
+## System Architecture
+
+KVRS acts as a recovery‑aware proxy that sits between clients and the DistServe backends.
+
+### Cluster‑level design
+
+![Cluster architecture with decision flow](img/architecture_cluster.png)  
+*Overall architecture: The load balancer detects failures, queries the local scheduler for the best remote node, compares C_recomp with C_mig, and then commands either a migrate or recompute action. A global state cache (gossip store) provides runtime bandwidths and queue lengths.*
+
+### Proxy internal components
+
+![Internal components of the KVRS proxy](img/architecture_proxy.png)  
+*Inside the KVRS proxy: four cooperating modules – Bandwidth Monitor (EWMA probes), Peer Gossip (periodic /stats polling), Slot Reservation (limits concurrent migrations to 32), and the Recovery Scheduler (executes the decision). Two separate DistServe instances run on Node 1 and Node 2, each with a failure state cache and reservation service.*
+
+---
+
+## Core Decision Algorithm
+
+```
+Constants (model‑specific)
+  N_LAYERS    = 40      // OPT‑13B
+  N_KV_HEADS  = 40
+  HEAD_DIM    = 128
+  DTYPE_SIZE  = 2       // fp16 (bytes)
+
+Pre‑profiled table (prompt length → prefill time in seconds)
+  PREFILL_TABLE = { 512: 0.03, 1024: 0.06, 2048: 0.12, … }
+
+function KV_CACHE_SIZE(prompt_len)
+    return 2 × N_LAYERS × N_KV_HEADS × HEAD_DIM × prompt_len × DTYPE_SIZE
+
+function MIGRATE_COST(prompt_len, bandwidth_mbps)
+    return KV_CACHE_SIZE(prompt_len) / (bandwidth_mbps × 10⁶)
+
+function RECOMPUTE_COST(prompt_len)
+    return LINEAR_INTERPOLATE(PREFILL_TABLE, prompt_len)
+
+function ROM_DECIDE(prompt_len, bandwidth_mbps, policy)
+    C_mig   ← MIGRATE_COST(prompt_len, bandwidth_mbps)
+    C_recomp ← RECOMPUTE_COST(prompt_len)
+
+    if policy = "always_migrate":   return "migrate"
+    if policy = "always_recompute": return "recompute"
+
+    // "rom" adaptive policy: choose the cheaper path; tie → migrate
+    return "migrate" if C_mig ≤ C_recomp else "recompute"
 ```
 
-## Launching
+On a failure, KVRS also checks the remaining SLO budget and returns `ABORT` if neither path can meet the deadline.
 
-### Launch Ray Cluster
+---
 
-DistServe relies on [Ray](https://ray.io) to implement distributed workers. If you do not launch a Ray runtime in advance, it will automatically initiate a cluster consisting of all the gpus on the current node. You may need to start the Ray runtime manually in advance if you want to use multiple nodes for inference.
+## Key Evaluation Results
 
-### Run offline example
+Experiments were run on a two‑node A100 cluster (UMass Unity) serving OPT‑13B, with cross‑node bandwidth emulated from 10 to 100 Gbps.
 
-DistServe requires at least two GPUs to play with. We provide an offline inference example in `examples/offline.py`.
+- The measured crossover queue depth matches the analytical model to within **2%**.  
 
-### Run online example
+![Initiation latency vs. local queue depth](img/crossover.png)  
+*Crossover validation: intra‑node queue delay rises linearly at ~60 ms/request, while inter‑node cost stays flat at 387 ms for a 1.21 GB cache on 25 Gbps. The crossing point matches the analytical prediction.*
 
-To run online inference, you need to launch the DistServe API server, see the comments in `distserve/api_server/distserve_api_server.py`.
+- Under 90% load skew, KVRS achieves **8.6% higher goodput** than the static intra‑node policy.
 
-Then launch the client example in `examples/online.py`.
+![Goodput vs load skew](img/goodput.png)  
+*System goodput under varying load imbalance. KVRS recovers goodput by migrating to the underutilised node, reclaiming 0.6 req/s (8.6%) at the extreme skew point.*
 
-### Evaluation
+All overhead is confined to the failure path; the healthy path remains identical to vanilla DistServe.
 
-To reproduce all the experiments in our paper, please follow the [guidance](./evaluation/README.md).
+---
 
-## Citation
-If you use DistServe for your research, please cite our [paper](https://arxiv.org/abs/2401.09670):
-```
-@misc{zhong2024distserve,
-      title={DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving}, 
-      author={Yinmin Zhong and Shengyu Liu and Junda Chen and Jianbo Hu and Yibo Zhu and Xuanzhe Liu and Xin Jin and Hao Zhang},
-      year={2024},
-      eprint={2401.09670},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC}
+## Citation & Acknowledgment
+
+This project is built directly on **DistServe**. We are grateful to the original authors for their open‑source contribution.
+
+**DistServe: Disaggregating Prefill and Decoding for Goodput‑optimized Large Language Model Serving**  
+Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, Hao Zhang  
+*18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 2024)*  
+[Paper](https://www.usenix.org/conference/osdi24/presentation/zhong-yinmin) | [Code](https://github.com/LLMServe/DistServe)
+
+```bibtex
+@inproceedings{zhong2024distserve,
+  author    = {Yinmin Zhong and Shengyu Liu and Junda Chen and Jianbo Hu and
+               Yibo Zhu and Xuanzhe Liu and Xin Jin and Hao Zhang},
+  title     = {{DistServe}: Disaggregating Prefill and Decoding for Goodput‑optimized
+               Large Language Model Serving},
+  booktitle = {18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24)},
+  year      = {2024},
 }
+```
+
+---
+
+## License
+
+This project inherits the **Apache License 2.0** from DistServe.
+
+---
+
+## Contact
+
+For questions about the KVRS scheduler, please reach out to the authors:
+
+- Nam Pham – `phuongnampha@umass.edu`
+- Zoya Siddiqui – `zsiddiqui@umass.edu`
+- Panashe Mandevbu – `pmandevbu@umass.edu`
 ```
