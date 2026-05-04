@@ -120,6 +120,108 @@ async def generate(request: Request) -> Response:
         return JSONResponse(ret)
 
 
+@app.get("/v1/rom/decision")
+async def rom_decision(
+    request_id: str,
+    bandwidth_mbps: Optional[float] = None,
+) -> ROMDecisionResponse:
+    """
+    Return the ROM decision for an in-flight request without acting on it.
+ 
+    Query parameters
+    ----------------
+    request_id     : (required) the request to evaluate
+    bandwidth_mbps : (optional) override the bandwidth used in the cost model
+ 
+    Returns 404 if the request is not currently in flight.
+    """
+    llm_engine = engine._engine
+ 
+    if request_id not in llm_engine._prompt_len_map:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Request {request_id!r} not found in active request map",
+        )
+ 
+    decision, prompt_len, c_mig, c_recomp = await llm_engine.get_rom_decision(
+        request_id=request_id,
+        bandwidth_mbps_override=bandwidth_mbps,
+    )
+ 
+    return ROMDecisionResponse(
+        request_id=request_id,
+        prompt_len=prompt_len,
+        bandwidth_mbps=bandwidth_mbps or 0.0,
+        c_mig_s=c_mig,
+        c_recomp_s=c_recomp,
+        decision=decision,
+        policy=llm_engine.rom_config.policy,
+    )
+
+
+@app.post("/v1/rom/recover")
+async def rom_recover(body: ROMRecoverRequest) -> ROMRecoverResponse:
+    """
+    Manually trigger the RoM recovery path for a specific request.
+ 
+    Body
+    ----
+    request_id : the request to recover
+    force      : "migrate", "recompute", or null (uses the ROM policy)
+ 
+    Returns 404 if the request is not found.
+    Returns 400 if ``force`` is an invalid value.
+ 
+    NOTE: This endpoint is for TESTING and OPERATIONAL INTERVENTION only.
+          In normal operation, recovery is triggered automatically by the
+          built-in decode-worker health monitor.
+    """
+    if body.force and body.force not in {"migrate", "recompute"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"force must be 'migrate', 'recompute', or null",
+        )
+ 
+    llm_engine = engine._engine
+ 
+    if body.request_id not in llm_engine._prompt_len_map:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Request {body.request_id!r} not found",
+        )
+ 
+    # Determine decision
+    if body.force:
+        decision = body.force
+        c_mig = c_recomp = 0.0
+    else:
+        decision, _pl, c_mig, c_recomp = await llm_engine.get_rom_decision(
+            body.request_id
+        )
+ 
+    # Execute recovery via the decoding engine
+    decode_engine = llm_engine.decoding_engine
+    try:
+        if decision == "migrate":
+            import ray as _ray
+            local_sched = _ray.get_actor("rom_local_scheduler")
+            target = await local_sched.get_best_decode_worker.remote()
+            await decode_engine.recover_via_migrate(body.request_id, target)
+        else:
+            await decode_engine.recover_via_recompute(body.request_id)
+        triggered = True
+        message = f"Recovery ({decision}) triggered successfully"
+    except Exception as exc:
+        triggered = False
+        message = str(exc)
+ 
+    return ROMRecoverResponse(
+        request_id=body.request_id,
+        decision=decision,
+        triggered=triggered,
+        message=message,
+    )
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="localhost")
