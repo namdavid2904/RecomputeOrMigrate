@@ -465,6 +465,247 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         # Note: len(batched_in_pipeline) <= pp_size and batches are appended in FIFO
         self.batches_in_pipeline = []
         self.batches_ret_futures = []
+        self._rom_decode_init(llm_engine, rom_config)
+        self._build_worker_index()
+
+    def _rom_decode_init(
+        self,
+        llm_engine: Optional["LLMEngine"],
+        rom_config: Optional[ROMConfig],
+    ) -> None:
+        """
+        Initialise RoM fields on DecodingStageLLMEngine.
+        """
+        self._llm_engine = llm_engine
+        self._rom_config: ROMConfig = rom_config or ROMConfig.from_env()
+        self._rom_logger: ROMLogger = ROMLogger(self._rom_config.log_file)
+    
+        # worker_idx → Ray actor handle for the first PP/TP rank of that worker
+        # Built from self.workers in _build_worker_index()
+        self._worker_handles: Dict[int, ray.actor.ActorHandle] = {}
+    
+        # Track which requests are assigned to each worker
+        # worker_idx → set of request_ids
+        self._worker_request_ids: Dict[int, set] = {}
+    
+        # Set of worker indices currently known to be dead (avoids duplicate alerts)
+        self._dead_workers: set = set()
+    
+        # Start the health monitor if enabled
+        if self._rom_config.monitor_enabled:
+            self._monitor_task = asyncio.ensure_future(
+                self._failure_monitor_loop()
+            )
+        else:
+            self._monitor_task = None
+    
+    def _build_worker_index(self) -> None:
+        """
+        Build self._worker_handles from the 2-D self.workers grid.
+        Uses the first tensor-parallel rank [pp_rank][0] as the health-check
+        representative for each pipeline stage.
+        """
+        self._worker_handles.clear()
+        for pp_rank, tp_workers in enumerate(self.workers):
+            if tp_workers:
+                self._worker_handles[pp_rank] = tp_workers[0]
+                self._worker_request_ids.setdefault(pp_rank, set())
+        
+    async def _failure_monitor_loop(self) -> None:
+        """
+        Periodically ping every decode worker.  On RayActorError, invoke the
+        RoM failure-handling path immediately.
+    
+        The loop continues indefinitely; individual worker failures do not stop
+        monitoring of remaining workers.
+        """
+        interval = self._rom_config.monitor_interval_s
+        while True:
+            await asyncio.sleep(interval)
+            for worker_idx, handle in list(self._worker_handles.items()):
+                if worker_idx in self._dead_workers:
+                    continue
+                try:
+                    # ping() returns True; we just need to detect actor death
+                    await handle.ping.remote()
+                except ray.exceptions.RayActorError as exc:
+                    await self._handle_decode_worker_failure(worker_idx, exc)
+                except Exception:
+                    # Network glitch or other transient error — skip this tick
+                    pass
+
+    async def _handle_decode_worker_failure(
+        self,
+        worker_idx: int,
+        error: Exception,
+    ) -> None:
+        """
+        Entry point for decode-worker failure recovery.
+    
+        For every in-flight request on the failed worker:
+        1. Call LLMEngine.get_rom_decision() to choose migrate vs recompute.
+        2. Log the decision.
+        3. Dispatch to recover_via_migrate() or recover_via_recompute().
+    
+        Parameters
+        ----------
+        worker_idx : index of the failed decode worker
+        error      : the RayActorError that triggered detection
+        """
+        self._dead_workers.add(worker_idx)
+        affected = list(self._worker_request_ids.get(worker_idx, set()))
+    
+        self._rom_logger.log_worker_failure(
+            worker_id=worker_idx,
+            affected_request_ids=affected,
+            error_msg=str(error),
+        )
+    
+        # Remove from LocalScheduler candidate pool
+        try:
+            local_sched = ray.get_actor("rom_local_scheduler")
+            local_sched.deregister_worker.remote(worker_idx)
+        except Exception:
+            pass
+    
+        if not affected:
+            return
+    
+        # Pick the best target worker once, reuse for all requests in this batch
+        target_worker_idx: Optional[int] = None
+        try:
+            local_sched = ray.get_actor("rom_local_scheduler")
+            target_worker_idx = await local_sched.get_best_decode_worker.remote(
+                exclude=[worker_idx]
+            )
+        except Exception:
+            pass
+    
+        for req_id in affected:
+            await self._recover_one_request(
+                request_id=req_id,
+                failed_worker_idx=worker_idx,
+                target_worker_idx=target_worker_idx,
+            )
+
+    async def _recover_one_request(
+        self,
+        request_id: str,
+        failed_worker_idx: int,
+        target_worker_idx: Optional[int],
+    ) -> None:
+        """
+        Run the ROM decision and execute the chosen recovery path for one request.
+        """
+        t_start = time.monotonic()
+    
+        # ── Obtain bandwidth estimate ──────────────────────────────────────────
+        bw_mbps = self._rom_config.sim_bandwidth_mbps
+        try:
+            local_sched = ray.get_actor("rom_local_scheduler")
+            bw_mbps = await local_sched.get_bandwidth.remote()
+        except Exception:
+            pass
+    
+        # ── ROM decision  ──────────────────────────────────────────────────────
+        if self._llm_engine is not None:
+            decision, prompt_len, c_mig, c_recomp = await (
+                self._llm_engine.get_rom_decision(request_id, bw_mbps)
+            )
+        else:
+            # Fallback if engine ref not wired up (e.g., integration tests)
+            from distserve.rom_decision import make_decision as _decide
+            decision, c_mig, c_recomp = _decide(0, bw_mbps, self._rom_config)
+            prompt_len = 0
+    
+        self._rom_logger.log_decision(
+            request_id=request_id,
+            prompt_len=prompt_len,
+            bandwidth_mbps=bw_mbps,
+            c_mig=c_mig,
+            c_recomp=c_recomp,
+            decision=decision,
+            policy=self._rom_config.policy,
+            failed_worker_id=failed_worker_idx,
+            target_worker_id=target_worker_idx,
+        )
+    
+        # ── Execute recovery ───────────────────────────────────────────────────
+        success = False
+        error_msg: Optional[str] = None
+        try:
+            if decision == "migrate" and target_worker_idx is not None:
+                await self.recover_via_migrate(request_id, target_worker_idx)
+            else:
+                await self.recover_via_recompute(request_id)
+            success = True
+        except Exception as exc:
+            error_msg = str(exc)
+    
+        latency_s = time.monotonic() - t_start
+        self._rom_logger.log_recovery(
+            request_id=request_id,
+            decision=decision,
+            success=success,
+            latency_s=latency_s,
+            error=error_msg,
+        )
+
+    async def recover_via_migrate(
+        self,
+        request_id: str,
+        target_worker_idx: int,
+    ) -> None:
+        """
+        Push-based KV-cache migration to target_worker_idx.
+    
+        This complements the existing pull-based _migrate_blocks() used in the
+        normal context→decode handoff.  Here we direct an existing decode worker
+        to push its KV cache to a different (healthy) decode worker.
+    
+        Implementation note
+        -------------------
+        The existing migrate_blocks() worker method is pull-based: the *receiver*
+        calls it on the sender.  For recovery, the sender is dead, so we use
+        the push variant push_kv_blocks_to() added to worker.py.
+    
+        If the failed worker is already dead and no live copy of the KV cache
+        exists, this raises RuntimeError and the caller falls back to recompute.
+    
+        Parameters
+        ----------
+        request_id        : id of the request to recover
+        target_worker_idx : pp_rank of the receiving decode worker
+        """
+        if target_worker_idx not in self._worker_handles:
+            raise RuntimeError(
+                f"Target worker {target_worker_idx} is not registered"
+            )
+    
+        target_handle = self._worker_handles[target_worker_idx]
+    
+        # Look up the block table for this request from the block manager
+        # (The block manager is attached to self as self.block_manager in
+        #  SingleStageLLMEngine.__init__)
+        if not hasattr(self, "block_manager"):
+            raise RuntimeError("block_manager not found on engine")
+    
+        # Ask the target worker to pull blocks from source (if alive) or use
+        # existing block table.  If source is dead, a RuntimeError surfaces here
+        # and the caller will fall back to recompute.
+        await target_handle.pull_kv_blocks_for_request.remote(
+            request_id=request_id,
+            block_table=self.block_manager.get_block_table(request_id),
+            source_worker_handles=[
+                h for idx, h in self._worker_handles.items()
+                if idx != target_worker_idx
+            ],
+        )
+    
+        # Update tracking: move request from failed worker to target
+        for worker_request_set in self._worker_request_ids.values():
+            worker_request_set.discard(request_id)
+        self._worker_request_ids.setdefault(target_worker_idx, set()).add(request_id)
         
     async def register_kvcache_mem_handles(
         self,
@@ -515,7 +756,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         
         target_block_indexes = self.block_manager.get_block_table(migrating_req.req.request_id)
         assert len(target_block_indexes) == len(migrating_req.block_indexes)
-        
+       
         # Transfer the blocks
         self.engine_on_new_lifetime_event_callback(
             migrating_req.req.request_id,
@@ -639,6 +880,15 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
 
         # proactive request migraion
         await self.scheduler.post_process()
+        try:
+            _sched = ray.get_actor("rom_local_scheduler")
+            _qlen  = self.scheduler.get_num_waiting_requests()
+            _sched.update_queue_length.remote(
+                worker_id=self._worker_idx,
+                length=_qlen,
+            )
+        except Exception:
+            pass
     
     async def start_event_loop(self):
         async def event_loop1():
