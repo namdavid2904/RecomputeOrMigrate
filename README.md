@@ -104,6 +104,35 @@ All overhead is confined to the failure path; the healthy path remains identical
 
 ---
 
+## Getting Started
+
+This project is built on top of **DistServe**. Please refer to the official [DistServe setup guide](https://github.com/LLMServe/DistServe#readme) for detailed environment requirements, cluster configuration, and hardware prerequisites.
+
+1. **Clone this repository** (it already contains the DistServe code plus the RoM scheduler):
+   ```bash
+   git clone https://github.com/namdavid2904/RecompOrMigrate.git
+   cd RecompOrMigrate
+   ```
+
+2. **Complete the DistServe installation steps** – the following commands are identical to the original DistServe workflow (skip the `git clone` step since you have already cloned this repository):
+   ```bash
+   # Create the conda environment
+   conda env create -f environment.yml && conda activate distserve
+
+   # Clone and build SwiftTransformer
+   git clone https://github.com/LLMServe/SwiftTransformer.git
+   cd SwiftTransformer && git submodule update --init --recursive
+   cmake -B build && cmake --build build -j$(nproc)
+   cd ..
+
+   # Install DistServe
+   pip install -e .
+   ```
+
+For launching Ray cluster, preparing the model, and running benchmarks, continue with the **[DistServe getting‑started guide](https://github.com/LLMServe/DistServe#readme)**.
+
+---
+
 ## Citation & Acknowledgment
 
 This project is built directly on **DistServe**. We are grateful to the original authors for their open‑source contribution.
