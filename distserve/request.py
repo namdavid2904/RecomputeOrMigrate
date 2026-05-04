@@ -380,6 +380,7 @@ class BatchedRequests:
 
 def create_request(
     prompt: Optional[str],
+    prompt_len: Optional[int],
     prompt_token_ids: Optional[List[str]],
     sampling_params: SamplingParams,
     request_counter: Counter,
@@ -401,6 +402,7 @@ def create_request(
         arrival_time,
         request_id,
         prompt,
+        prompt_len,
         prompt_token_ids,
         sampling_params,
     )
