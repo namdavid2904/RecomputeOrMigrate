@@ -51,7 +51,7 @@ class ParaWorker:
         self.tensor_parallel_id = tensor_parallel_id
         self.pipeline_parallel_id = pipeline_parallel_id
         self.gpu_id = ray.get_gpu_ids()[0]
-        
+       
         self.device = torch.device(f"cuda:0")
         torch.cuda.set_device(self.device)
         
@@ -73,6 +73,7 @@ class ParaWorker:
         # Statistics
         self.execution_time = 0.0
         self.blocked_swapping_time = 0.0
+        self._kvcache_mem_handles: list = []
 
     def ready(self):
         """
@@ -129,7 +130,8 @@ class ParaWorker:
             kv_swap_shape, dtype=self.model_config.get_torch_dtype(), device="cpu", pin_memory=True
         )
         torch.cuda.synchronize()
-        
+        self._kvcache_mem_handles = handles
+       
         return torch.ops.block_migration_ops.get_ipc_mem_handle(self.k_cache), \
                torch.ops.block_migration_ops.get_ipc_mem_handle(self.v_cache)
 
@@ -332,3 +334,130 @@ class ParaWorker:
         if self.latest_swap_out_event is not None:
             self.latest_swap_out_event.synchronize()
             self.latest_swap_out_event = None
+
+    def ping(self) -> bool:
+        """
+        Health probe.
+    
+        Returns True immediately.  The failure monitor in
+        DecodingStageLLMEngine calls this via Ray remote(); if the actor has
+        crashed, the call raises RayActorError which is the detection signal.
+    
+        No computation, no GPU access — just a round-trip through Ray's actor
+        message queue.
+        """
+        return True
+    
+    async def pull_kv_blocks_for_request(
+        self,
+        request_id: str,
+        block_table: list,
+        source_worker_handles: List[ray.actor.ActorHandle],
+    ) -> None:
+        """
+        Pull KV-cache blocks for request_id from a live source worker.
+    
+        This is the recovery-path counterpart to the existing pull-based
+        _migrate_blocks() used during the normal context→decode handoff.
+        The key difference is that here we are pulling between decode workers
+        rather than from a context worker to a decode worker.
+    
+        Parameters
+        ----------
+        request_id            : the request whose KV cache we are importing
+        block_table           : list of (logical_block_idx, physical_block_idx)
+                                pairs from the block manager
+        source_worker_handles : Ray actor handles of live decode workers that
+                                might hold the KV cache.  Tried in order; the
+                                first successful transfer wins.
+    
+        Implementation note
+        -------------------
+        The existing migrate_blocks() RPC is designed for context→decode
+        migration.  We reuse its CUDA IPC mechanism here with the same
+        physical-block layout.  If all source workers are dead, a RuntimeError
+        is raised and the caller falls back to recomputation.
+    
+        TODO: replace the source-scan loop with a deterministic lookup once the block manager tracks per-request ownership across worker failures.
+        """
+        if not source_worker_handles:
+            raise RuntimeError(
+                f"pull_kv_blocks_for_request: no source workers available "
+                f"for request {request_id!r}"
+            )
+    
+        last_exc: Exception = RuntimeError("no sources tried")
+        for source_handle in source_worker_handles:
+            try:
+                # migrate_blocks() is defined on ParaWorker (lines ~250-267).
+                # It copies blocks from 'source_kv_cache_mem_handles' to this
+                # worker's local KV cache.
+                src_handles = await source_handle.get_kvcache_mem_handles.remote()
+                await self._call_migrate_blocks(
+                    migrating_request_id=request_id,
+                    src_to_dst_block_map={blk: blk for blk in block_table},
+                    src_worker_kvcache_mem_handles=src_handles,
+                )
+                return   # success
+            except ray.exceptions.RayActorError as exc:
+                last_exc = exc
+                continue   # try next source
+            except Exception as exc:
+                last_exc = exc
+                break   # unexpected error — don't retry
+    
+        raise RuntimeError(
+            f"pull_kv_blocks_for_request: all sources exhausted "
+            f"for request {request_id!r}: {last_exc}"
+        ) from last_exc
+ 
+ 
+    async def _call_migrate_blocks(
+        self,
+        migrating_request_id: str,
+        src_to_dst_block_map: dict,
+        src_worker_kvcache_mem_handles: list,
+    ) -> None:
+        """
+        Thin async shim around the synchronous migrate_blocks() method.
+    
+        Calls self.migrate_blocks() (existing implementation, lines ~250-267)
+        in a thread-pool executor so we don't block the Ray event loop.
+        """
+        import asyncio
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self.migrate_blocks,
+            migrating_request_id,
+            src_to_dst_block_map,
+            src_worker_kvcache_mem_handles,
+        )
+    def get_kvcache_mem_handles(self) -> list:
+        """
+        Return the CUDA IPC memory handles for this worker's KV cache.
+        
+        These handles are used by pull_kv_blocks_for_request() on the
+        receiving worker to access the source worker's GPU memory over PCIe
+        or NVLink.
+    
+        Returns
+        -------
+        list
+            The kvcache_mem_handles that were returned by init_kvcache_and_swap().
+            Returns an empty list if the cache has not been initialised.
+    
+        Notes
+        -----
+        This getter requires that ParaWorker.__init__() stores the handles as an
+        instance variable after calling init_kvcache_and_swap().  Insert the
+        following line at the end of the init_kvcache_and_swap() call site
+        (in SingleStageLLMEngine, lines ~112-142):
+    
+            self._kvcache_mem_handles = handles   # store for recovery path
+    
+        And add this init line in ParaWorker.__init__():
+   
+            self._kvcache_mem_handles: list = []
+        """
+        return getattr(self, "_kvcache_mem_handles", [])
