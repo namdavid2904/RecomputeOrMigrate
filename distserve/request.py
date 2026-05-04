@@ -174,6 +174,7 @@ class Request:
         arrival_time: float,
         request_id: int,
         prompt: str,
+        prompt_len: int = 0,
         prompt_token_ids: List[int],
         sampling_params: SamplingParams = SamplingParams(),
         priority: int = 0
