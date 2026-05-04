@@ -46,7 +46,7 @@ KVRS acts as a recovery‑aware proxy that sits between clients and the DistServ
 ### Proxy internal components
 
 ![Internal components of the KVRS proxy](img/architecture_proxy.png)  
-*Inside the KVRS proxy: four cooperating modules – Bandwidth Monitor (EWMA probes), Peer Gossip (periodic /stats polling), Slot Reservation (limits concurrent migrations to 32), and the Recovery Scheduler (executes the decision). Two separate DistServe instances run on Node 1 and Node 2, each with a failure state cache and reservation service.*
+*Inside the KVRS proxy: four cooperating modules – Bandwidth Monitor (EWMA probes), Peer Gossip (periodic stats polling), Slot Reservation (limits concurrent migrations to 32), and the Recovery Scheduler (executes the decision). Two separate DistServe instances run on Node 1 and Node 2, each with a failure state cache and reservation service.*
 
 ---
 
