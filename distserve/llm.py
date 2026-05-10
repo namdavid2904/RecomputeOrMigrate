@@ -81,7 +81,7 @@ class OfflineLLM:
             prompt = prompts[req_index] if prompts is not None else None
             token_ids = None if prompt_token_ids is None else prompt_token_ids[req_index]
             step_outputs = []
-            async for step_output in self.engine.generate(prompt, token_ids, sampling_params[req_index]):
+            async for step_output in self.engine.generate(prompt, None, token_ids, sampling_params[req_index]):
                 step_outputs.append(step_output)
             return step_outputs
         
@@ -196,6 +196,7 @@ class AsyncLLM:
         arrival_time = time.time()
         async for step_output in  self.engine.generate(
             prompt,
+            None,
             prompt_token_ids,
             sampling_params,
             arrival_time,
