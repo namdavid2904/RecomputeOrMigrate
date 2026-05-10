@@ -168,8 +168,8 @@ async def rom_decision(
  
     Returns 404 if the request is not currently in flight.
     """
-    llm_engine = _require_engine()._engine
- 
+    llm_engine = _require_engine().engine
+
     if request_id not in llm_engine._prompt_len_map:
         raise HTTPException(
             status_code=404,
@@ -215,7 +215,7 @@ async def rom_recover(body: ROMRecoverRequest) -> ROMRecoverResponse:
             detail=f"force must be 'migrate', 'recompute', or null",
         )
  
-    llm_engine = _require_engine()._engine
+    llm_engine = _require_engine().engine
  
     if body.request_id not in llm_engine._prompt_len_map:
         raise HTTPException(
