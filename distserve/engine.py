@@ -134,9 +134,11 @@ class LLMEngine:
             placement_groups,
             self.context_engine.clear_migrated_blocks_callback,
             self._on_new_step_output_callback,
-            self._on_new_lifetime_event_callback
+            self._on_new_lifetime_event_callback,
+            llm_engine=self,
+            rom_config=self.rom_config,
         )
-        
+       
         # request_id -> list of StepOutput
         # Created when calling self.generate()
         # Cleared when the request is finished
@@ -314,7 +316,15 @@ class LLMEngine:
         
         self._on_new_lifetime_event_callback(req.request_id, LifetimeEvent(LifetimeEventType.Issued))
         self.context_engine.add_request(req)
-        self._prompt_len_map[request_id] = _prompt_len if _prompt_len is not None else len(self.tokenizer.tokenize(prompt)) if prompt is not None else 0
+        prompt_len_value = prompt_len
+        if prompt_len_value is None:
+            if prompt_token_ids is not None:
+                prompt_len_value = len(prompt_token_ids)
+            elif prompt is not None:
+                prompt_len_value = len(self.tokenizer.tokenize(prompt))
+            else:
+                prompt_len_value = 0
+        self._prompt_len_map[request_id] = prompt_len_value
         
         while True:
             try:
