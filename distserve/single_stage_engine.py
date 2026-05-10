@@ -27,6 +27,8 @@ from distserve.block_manager import BlockManager
 from distserve.worker import ParaWorker
 from distserve.context_stage_scheduler import ContextStageSchedConfig, ContextStageScheduler, get_context_stage_scheduler
 from distserve.decoding_stage_scheduler import DecodingStageSchedConfig, DecodingStageScheduler, get_decoding_stage_scheduler
+from distserve.rom_config import ROMConfig
+from distserve.rom_logger import ROMLogger
 
 logger = init_logger(__name__)
 
@@ -445,7 +447,9 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         placement_groups: List[PlacementGroup],
         clear_migrated_blocks_callback: Callable[[Request], None],
         engine_on_new_step_output_callback: Callable[[int, StepOutput], None],
-        engine_on_new_lifetime_event_callback: Callable[[int, LifetimeEvent, bool], None]
+        engine_on_new_lifetime_event_callback: Callable[[int, LifetimeEvent, bool], None],
+        llm_engine: Optional["LLMEngine"] = None,
+        rom_config: Optional[ROMConfig] = None,
     ):
         super().__init__(
             Stage.DECODING,
@@ -725,8 +729,6 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
     
     def _free_request_resources(self, request_id: int):
         super()._free_request_resources(request_id)
-        self.request_events.pop(request_id)
-        self.request_outputs.pop(request_id)
         
     async def _migrate_blocks(
         self,
