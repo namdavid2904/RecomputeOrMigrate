@@ -123,7 +123,7 @@ class LLMEngine:
             self._on_new_step_output_callback,
             self._on_new_lifetime_event_callback
         )
-        
+        self._rom_init()
         logger.info("Initializing decoding stage LLM engine")
         self.decoding_engine = DecodingStageLLMEngine(
             self.bridge_queue,
@@ -147,34 +147,33 @@ class LLMEngine:
         # Cleared by the caller of self.generate() (i.e. the engine does not clear that)
         # TODO: clear this automatically to avoid memory leak
         self.request_lifetime_events: Dict[int, List[LifetimeEvent]] = {}
-        
+      
         self.engine_initialized = False
-        self._rom_init()
     
     def _rom_init(self) -> None:
-    """
-    Initialise all RoM scheduler components
-    """
-    # Load config (respects ROM_* env vars)
-    self.rom_config: ROMConfig = ROMConfig.from_env()
- 
-    # Local scheduler actor — named so the decoding engine can locate it
-    self._local_scheduler: LocalScheduler = LocalScheduler.options(
-        name="rom_local_scheduler",
-        get_if_exists=True,
-    ).remote(self.rom_config)
- 
-    # Structured JSONL logger
-    self._rom_logger: ROMLogger = ROMLogger(log_file=self.rom_config.log_file)
- 
-    # prompt_len map: request_id (str) → prompt token count (int)
-    # Populated in generate(); consumed by get_rom_decision()
-    self._prompt_len_map: dict[str, int] = {}
- 
-    self._rom_logger._logger.info(
-        '{"event":"rom_init","policy":"%s","monitor_enabled":%s}'
-        % (self.rom_config.policy, str(self.rom_config.monitor_enabled).lower())
-    )
+        """
+        Initialise all RoM scheduler components
+        """
+        # Load config (respects ROM_* env vars)
+        self.rom_config: ROMConfig = ROMConfig.from_env()
+    
+        # Local scheduler actor — named so the decoding engine can locate it
+        self._local_scheduler: LocalScheduler = LocalScheduler.options(
+            name="rom_local_scheduler",
+            get_if_exists=True,
+        ).remote(self.rom_config)
+    
+        # Structured JSONL logger
+        self._rom_logger: ROMLogger = ROMLogger(log_file=self.rom_config.log_file)
+    
+        # prompt_len map: request_id (str) → prompt token count (int)
+        # Populated in generate(); consumed by get_rom_decision()
+        self._prompt_len_map: dict[str, int] = {}
+    
+        self._rom_logger._logger.info(
+            '{"event":"rom_init","policy":"%s","monitor_enabled":%s}'
+            % (self.rom_config.policy, str(self.rom_config.monitor_enabled).lower())
+        )
     
     def _on_new_step_output_callback(self, request_id: int, step_output: StepOutput):
         """
@@ -315,7 +314,7 @@ class LLMEngine:
         
         self._on_new_lifetime_event_callback(req.request_id, LifetimeEvent(LifetimeEventType.Issued))
         self.context_engine.add_request(req)
-        self._prompt_len_map[request_id] = _prompt_len
+        self._prompt_len_map[request_id] = _prompt_len if _prompt_len is not None else len(self.tokenizer.tokenize(prompt)) if prompt is not None else 0
         
         while True:
             try:
@@ -331,117 +330,117 @@ class LLMEngine:
                 break
                 
         del self.request_outputs[req.request_id]
-        self._prompt_len_map.pop(request_id, None) 
+        self._prompt_len_map.pop(req.request_id, None) 
 
     def abort_request(self, request_id: int):
         self.context_engine.abort_request(request_id)
         self.decoding_engine.abort_request(request_id)
     
     async def get_rom_decision(
-    self,
-    request_id: str,
-    bandwidth_mbps_override: float | None = None,
-) -> tuple[str, int, float, float]:
-    """
-    Compute and return the RoM decision for request_id.
- 
-    Called by the failure monitor in DecodingStageLLMEngine when a decode
-    worker fails and a recovery path must be chosen.
- 
-    Parameters
-    ----------
-    request_id             : the failing request's unique id
-    bandwidth_mbps_override: if provided, use this bandwidth estimate
-                             instead of querying LocalScheduler (useful
-                             for tests or when the caller already holds
-                             a fresh measurement).
- 
-    Returns
-    -------
-    (decision, prompt_len, c_mig, c_recomp)
-        decision   : "migrate" or "recompute"
-        prompt_len : number of tokens in the original prompt
-        c_mig      : estimated migration cost (seconds)
-        c_recomp   : estimated recomputation cost (seconds)
- 
-    Notes
-    -----
-    If request_id is unknown, prompt_len
-    defaults to 0 and the decision defaults to "migrate".
-    """
-    prompt_len = self._prompt_len_map.get(request_id, 0)
- 
-    if bandwidth_mbps_override is not None:
-        bw = bandwidth_mbps_override
-    else:
-        bw = await self._local_scheduler.get_bandwidth.remote()
- 
-    decision, c_mig, c_recomp = make_decision(
-        prompt_len=prompt_len,
-        bandwidth_mbps=bw,
-        rom_config=self.rom_config,
-    )
-    return decision, prompt_len, c_mig, c_recomp
+        self,
+        request_id: str,
+        bandwidth_mbps_override: float | None = None,
+    ) -> tuple[str, int, float, float]:
+        """
+        Compute and return the RoM decision for request_id.
+    
+        Called by the failure monitor in DecodingStageLLMEngine when a decode
+        worker fails and a recovery path must be chosen.
+    
+        Parameters
+        ----------
+        request_id             : the failing request's unique id
+        bandwidth_mbps_override: if provided, use this bandwidth estimate
+                                instead of querying LocalScheduler (useful
+                                for tests or when the caller already holds
+                                a fresh measurement).
+    
+        Returns
+        -------
+        (decision, prompt_len, c_mig, c_recomp)
+            decision   : "migrate" or "recompute"
+            prompt_len : number of tokens in the original prompt
+            c_mig      : estimated migration cost (seconds)
+            c_recomp   : estimated recomputation cost (seconds)
+    
+        Notes
+        -----
+        If request_id is unknown, prompt_len
+        defaults to 0 and the decision defaults to "migrate".
+        """
+        prompt_len = self._prompt_len_map.get(request_id, 0)
+    
+        if bandwidth_mbps_override is not None:
+            bw = bandwidth_mbps_override
+        else:
+            bw = await self._local_scheduler.get_bandwidth.remote()
+    
+        decision, c_mig, c_recomp = make_decision(
+            prompt_len=prompt_len,
+            bandwidth_mbps=bw,
+            rom_config=self.rom_config,
+        )
+        return decision, prompt_len, c_mig, c_recomp
 
     async def _probe_bandwidth(self) -> None:
-    """
-    Probe inter-node bandwidth and push to scheduler.
- 
-    Runs once per monitor_interval_s (same cadence as the health monitor).
-    Uses a small Ray object-store round-trip to approximate NIC throughput.
-    """
-    import time as _time
- 
-    PROBE_SIZE_BYTES = 4 * 1024 * 1024  # 4 MB probe payload
-    PROBE_INTERVAL_S = self.rom_config.monitor_interval_s * 5  # less frequent
- 
-    while True:
-        try:
-            payload = b"\x00" * PROBE_SIZE_BYTES
-            t0 = _time.monotonic()
-            ref = ray.put(payload)
-            await asyncio.get_event_loop().run_in_executor(None, ray.get, ref)
-            elapsed = _time.monotonic() - t0
-            if elapsed > 0:
-                bw_mbps = (PROBE_SIZE_BYTES / elapsed) / 1_000_000
-                self._local_scheduler.update_bandwidth.remote(bw_mbps)
-        except Exception:
-            pass  # probe failure is non-fatal
-        await asyncio.sleep(PROBE_INTERVAL_S)
+        """
+        Probe inter-node bandwidth and push to scheduler.
+    
+        Runs once per monitor_interval_s (same cadence as the health monitor).
+        Uses a small Ray object-store round-trip to approximate NIC throughput.
+        """
+        import time as _time
+    
+        PROBE_SIZE_BYTES = 4 * 1024 * 1024  # 4 MB probe payload
+        PROBE_INTERVAL_S = self.rom_config.monitor_interval_s * 5  # less frequent
+    
+        while True:
+            try:
+                payload = b"\x00" * PROBE_SIZE_BYTES
+                t0 = _time.monotonic()
+                ref = ray.put(payload)
+                await asyncio.get_event_loop().run_in_executor(None, ray.get, ref)
+                elapsed = _time.monotonic() - t0
+                if elapsed > 0:
+                    bw_mbps = (PROBE_SIZE_BYTES / elapsed) / 1_000_000
+                    self._local_scheduler.update_bandwidth.remote(bw_mbps)
+            except Exception:
+                pass  # probe failure is non-fatal
+            await asyncio.sleep(PROBE_INTERVAL_S)
 
     def apply_model_config_to_rom(
-    self,
-    num_layers: int,
-    num_kv_heads: int,
-    head_dim: int,
-) -> None:
-    """
-    Override ROMConfig architecture parameters with values extracted from
-    the loaded model.
- 
-    Call this inside LLMEngine.__init__() after _remote_call_all_workers()
-    returns the architecture metadata:
- 
-        model_meta = ray.get(
-            self.context_engine.workers[0][0].get_model_config.remote()
+        self,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> None:
+        """
+        Override ROMConfig architecture parameters with values extracted from
+        the loaded model.
+    
+        Call this inside LLMEngine.__init__() after _remote_call_all_workers()
+        returns the architecture metadata:
+    
+            model_meta = ray.get(
+                self.context_engine.workers[0][0].get_model_config.remote()
+            )
+            self.apply_model_config_to_rom(
+                num_layers   = model_meta["num_layers"],
+                num_kv_heads = model_meta["num_kv_heads"],
+                head_dim     = model_meta["head_dim"],
+            )
+    
+        Parameters
+        ----------
+        num_layers   : number of transformer layers
+        num_kv_heads : number of K/V attention heads per layer
+        head_dim     : feature dimension of each head
+        """
+        self.rom_config.update_from_model_config(num_layers, num_kv_heads, head_dim)
+        self._rom_logger._logger.info(
+            '{"event":"rom_model_config","num_layers":%d,"num_kv_heads":%d,'
+            '"head_dim":%d}' % (num_layers, num_kv_heads, head_dim)
         )
-        self.apply_model_config_to_rom(
-            num_layers   = model_meta["num_layers"],
-            num_kv_heads = model_meta["num_kv_heads"],
-            head_dim     = model_meta["head_dim"],
-        )
- 
-    Parameters
-    ----------
-    num_layers   : number of transformer layers
-    num_kv_heads : number of K/V attention heads per layer
-    head_dim     : feature dimension of each head
-    """
-    self.rom_config.update_from_model_config(num_layers, num_kv_heads, head_dim)
-    self._rom_logger._logger.info(
-        '{"event":"rom_model_config","num_layers":%d,"num_kv_heads":%d,'
-        '"head_dim":%d}' % (num_layers, num_kv_heads, head_dim)
-    )
         
 def add_engine_cli_args(parser: argparse.ArgumentParser):
     parser.add_argument("--model", type=str, required=True)

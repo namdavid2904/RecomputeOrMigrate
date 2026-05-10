@@ -28,15 +28,15 @@ python -m distserve.api_server.distserve_api_server \\
 
 import argparse
 import json
-from typing import AsyncGenerator, List, Tuple
+from typing import AsyncGenerator, List, Tuple, Optional
 import asyncio
 import time
 import traceback
 import sys, os
 import signal
-
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
 import uvicorn
 
 import distserve
@@ -62,6 +62,38 @@ logger = init_logger(__name__)
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 app = FastAPI()
+engine: Optional[AsyncLLM] = None
+
+
+class ROMDecisionResponse(BaseModel):
+    request_id: str
+    prompt_len: int
+    bandwidth_mbps: float
+    c_mig_s: float
+    c_recomp_s: float
+    decision: str
+    policy: str
+
+
+class ROMRecoverRequest(BaseModel):
+    request_id: str
+    force: Optional[str] = None
+
+
+class ROMRecoverResponse(BaseModel):
+    request_id: str
+    decision: str
+    triggered: bool
+    message: str
+
+
+def _require_engine() -> AsyncLLM:
+    if engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Engine not initialized",
+        )
+    return engine
 
 
 @app.post("/generate")
@@ -79,7 +111,8 @@ async def generate(request: Request) -> Response:
     stream = request_dict.pop("stream", False)
     sampling_params = SamplingParams(**request_dict)
     request_id = random_uuid()
-    results_generator = engine.generate(
+    llm = _require_engine()
+    results_generator = llm.generate(
         request_id, prompt=prompt, sampling_params=sampling_params
     )
 
@@ -92,7 +125,7 @@ async def generate(request: Request) -> Response:
                 yield (json.dumps(ret)).encode("utf-8")
 
         async def abort_request() -> None:
-            await engine.abort(request_id)
+            await llm.abort(request_id)
 
         background_tasks = BackgroundTasks()
         # Abort the request if the client disconnects.
@@ -106,11 +139,11 @@ async def generate(request: Request) -> Response:
         async for step_output in results_generator:
             if await request.is_disconnected():
                 # Abort the request if the client disconnects.
-                await engine.abort(request_id)
+                await llm.abort(request_id)
                 return Response(status_code=499)
             final_outputs.append((step_output, time.perf_counter()))
 
-        request_events = engine.get_and_pop_request_lifetime_events(request_id)
+        request_events = llm.get_and_pop_request_lifetime_events(request_id)
         text_output = prompt + ''.join([step_output[0].new_token for step_output in final_outputs])
         ret = {
             "text": text_output,
@@ -135,7 +168,7 @@ async def rom_decision(
  
     Returns 404 if the request is not currently in flight.
     """
-    llm_engine = engine._engine
+    llm_engine = _require_engine()._engine
  
     if request_id not in llm_engine._prompt_len_map:
         raise HTTPException(
@@ -182,7 +215,7 @@ async def rom_recover(body: ROMRecoverRequest) -> ROMRecoverResponse:
             detail=f"force must be 'migrate', 'recompute', or null",
         )
  
-    llm_engine = engine._engine
+    llm_engine = _require_engine()._engine
  
     if body.request_id not in llm_engine._prompt_len_map:
         raise HTTPException(
