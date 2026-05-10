@@ -818,6 +818,9 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             # push the batch into pipeline
             batched_requests.start_one_iteration(time.time())
             self.batches_in_pipeline.append(batched_requests)
+            request_ids = batched_requests.get_request_ids()
+            for worker_request_set in self._worker_request_ids.values():
+                worker_request_set.update(request_ids)
             remote_calls = self._remote_call_all_workers_async(
                 "step",
                 batched_requests.get_request_ids(),
@@ -869,6 +872,9 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                             LifetimeEvent(LifetimeEventType.DecodingEnd)
                         )
                 finished_reqs = self.scheduler.pop_finished_requests()
+                for req in finished_reqs:
+                    for worker_request_set in self._worker_request_ids.values():
+                        worker_request_set.discard(req.request_id)
 
                 # free blocks for finished requests
                 self.block_manager.free_blocks_batched(finished_reqs)
@@ -889,6 +895,12 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 worker_id=self._worker_idx,
                 length=_qlen,
             )
+            if self._worker_handles:
+                for worker_id in self._worker_handles.keys():
+                    _sched.update_queue_length.remote(
+                        worker_id=worker_id,
+                        length=_qlen,
+                    )
         except Exception:
             pass
     
