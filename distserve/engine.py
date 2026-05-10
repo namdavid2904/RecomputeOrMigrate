@@ -124,6 +124,11 @@ class LLMEngine:
             self._on_new_lifetime_event_callback
         )
         self._rom_init()
+        self.apply_model_config_to_rom(
+            num_layers=self.model_config.hf_config.num_hidden_layers,
+            num_kv_heads=self.model_config.get_num_heads(),
+            head_dim=self.model_config.get_head_size(),
+        )
         logger.info("Initializing decoding stage LLM engine")
         self.decoding_engine = DecodingStageLLMEngine(
             self.bridge_queue,
@@ -244,8 +249,23 @@ class LLMEngine:
             self.context_engine.parallel_config,
             self.context_engine.kv_cache_mem_handles
         )
+        self.decoding_engine._build_worker_index()
+        await self._register_rom_workers()
         self.engine_initialized = True
+    
+    async def _register_rom_workers(self) -> None:
+        if not hasattr(self, "_local_scheduler"):
+            return
         
+        worker_count = len(self.decoding_engine.workers)
+        if worker_count == 0:
+            return
+        tasks = [
+            self._local_scheduler.register_worker.remote(worker_id)
+            for worker_id in range(worker_count)
+        ]
+        await asyncio.gather(*tasks)
+
     def _remote_call_all_workers(
         self, 
         func_name: str, 
@@ -270,7 +290,8 @@ class LLMEngine:
         return handlers
 
     async def _start_my_event_loop(self):
-        pass
+        #pass
+        await self._probe_bandwidth()
     
     async def start_all_event_loops(self):
         """
